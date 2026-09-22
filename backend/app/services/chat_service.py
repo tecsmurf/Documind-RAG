@@ -26,7 +26,8 @@ Why Gemini instead of OpenAI?
 import json
 from typing import AsyncGenerator
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -34,7 +35,7 @@ from app.core.config import settings
 from app.models import Conversation, Message
 from app.services.retrieval_service import retrieve_relevant_chunks, build_context
 
-genai.configure(api_key=settings.GOOGLE_API_KEY)
+client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 SYSTEM_PROMPT = """You are an AI research assistant. You answer questions based on the provided document context.
 
@@ -64,16 +65,18 @@ async def get_conversation_history(db: AsyncSession, conversation_id: int, limit
     return [{"role": m.role, "content": m.content} for m in messages]
 
 
-def _build_gemini_history(history: list[dict]) -> list[dict]:
+def _build_gemini_contents(history: list[dict], question: str) -> list[types.Content]:
     """
-    Convert our message format to Gemini's format.
+    Build Gemini content list from conversation history + new question.
     Gemini uses 'user' and 'model' roles (not 'assistant').
     """
-    gemini_history = []
+    contents = []
     for msg in history:
         role = "model" if msg["role"] == "assistant" else "user"
-        gemini_history.append({"role": role, "parts": [msg["content"]]})
-    return gemini_history
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+    # Add the new question
+    contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+    return contents
 
 
 async def chat(
@@ -99,20 +102,19 @@ async def chat(
     # Step 3: Get conversation history
     history = await get_conversation_history(db, conversation_id)
 
-    # Step 4: Create Gemini model with system instruction
-    model = genai.GenerativeModel(
-        model_name=settings.GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT.format(context=context),
-        generation_config=genai.types.GenerationConfig(
+    # Step 4: Build contents for Gemini
+    contents = _build_gemini_contents(history, question)
+
+    # Step 5: Call Gemini
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT.format(context=context),
             temperature=0.1,
             max_output_tokens=2000,
         ),
     )
-
-    # Step 5: Build chat with history and ask
-    gemini_history = _build_gemini_history(history)
-    chat_session = model.start_chat(history=gemini_history)
-    response = chat_session.send_message(question)
 
     answer = response.text
 
@@ -167,19 +169,8 @@ async def chat_stream(
     context = build_context(chunks)
     history = await get_conversation_history(db, conversation_id)
 
-    # Create Gemini model
-    model = genai.GenerativeModel(
-        model_name=settings.GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT.format(context=context),
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.1,
-            max_output_tokens=2000,
-        ),
-    )
-
-    # Build chat with history
-    gemini_history = _build_gemini_history(history)
-    chat_session = model.start_chat(history=gemini_history)
+    # Build contents for Gemini
+    contents = _build_gemini_contents(history, question)
 
     # Build citations
     citations = [
@@ -199,7 +190,15 @@ async def chat_stream(
 
     # Stream from Gemini
     full_response = ""
-    response = chat_session.send_message(question, stream=True)
+    response = client.models.generate_content_stream(
+        model=settings.GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT.format(context=context),
+            temperature=0.1,
+            max_output_tokens=2000,
+        ),
+    )
 
     for chunk in response:
         if chunk.text:

@@ -3,7 +3,7 @@ Embedding Service — Convert text to vectors using Google Gemini (FREE)
 ======================================================================
 
 What are embeddings?
-    Text → [0.023, -0.041, 0.089, ...] (768 numbers with Gemini)
+    Text → [0.023, -0.041, 0.089, ...] (3072 numbers with Gemini)
     
     Similar text → similar vectors → can find by distance
     
@@ -12,25 +12,24 @@ What are embeddings?
     "Cooking recipes"     → [-0.5, 0.1, 0.8, ...]  ← DIFFERENT vector
 
 Why Gemini instead of OpenAI?
-    - Google Gemini text-embedding-004 is FREE (1500 requests/day)
+    - Google Gemini gemini-embedding-001 is FREE (1500 requests/day)
     - OpenAI text-embedding-3-small costs $0.02/1M tokens
     - Quality is comparable for RAG use cases
 """
-import google.generativeai as genai
+from google import genai
 
 from app.core.config import settings
 
-genai.configure(api_key=settings.GOOGLE_API_KEY)
+client = genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 
 async def get_embedding(text: str) -> list[float]:
     """Convert a single text to an embedding vector using Gemini."""
-    result = genai.embed_content(
-        model=f"models/{settings.GEMINI_EMBEDDING_MODEL}",
-        content=text,
-        task_type="retrieval_query",
+    result = client.models.embed_content(
+        model=settings.GEMINI_EMBEDDING_MODEL,
+        contents=text,
     )
-    return result["embedding"]
+    return list(result.embeddings[0].values)
 
 
 async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
@@ -43,18 +42,17 @@ async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
 
-    # Gemini supports batch embedding — pass list of texts
     # Process in batches of 100 to avoid potential limits
     batch_size = 100
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        result = genai.embed_content(
-            model=f"models/{settings.GEMINI_EMBEDDING_MODEL}",
-            content=batch,
-            task_type="retrieval_document",
+        result = client.models.embed_content(
+            model=settings.GEMINI_EMBEDDING_MODEL,
+            contents=batch,
         )
-        all_embeddings.extend(result["embedding"])
+        for emb in result.embeddings:
+            all_embeddings.append(list(emb.values))
 
     return all_embeddings

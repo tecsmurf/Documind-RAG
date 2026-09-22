@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     # Google Gemini (FREE tier)
     GOOGLE_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.0-flash"
-    GEMINI_EMBEDDING_MODEL: str = "text-embedding-004"
-    EMBEDDING_DIMENSIONS: int = 768  # Gemini text-embedding-004 outputs 768-dim vectors
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    EMBEDDING_DIMENSIONS: int = 3072  # Gemini gemini-embedding-001 outputs 3072-dim vectors
 
     # RAG Settings
     CHUNK_SIZE: int = 500
