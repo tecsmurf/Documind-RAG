@@ -72,7 +72,7 @@ class Chunk(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)  # Position in document
     page_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    chunk_metadata: Mapped[Optional[dict]] = mapped_column("metadata", JSON, nullable=True)
 
     # THE VECTOR EMBEDDING — 1536 dimensions from OpenAI text-embedding-3-small
     embedding = mapped_column(Vector(settings.EMBEDDING_DIMENSIONS), nullable=True)
