@@ -115,6 +115,7 @@ export default function ChatPage() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let fullText = '';
+      let streamCitations = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -127,14 +128,15 @@ export default function ChatPage() {
             try {
               const data = JSON.parse(line.slice(6));
               if (data.type === 'token') {
-                fullText += data.content;
+                fullText += data.data;
                 setStreamText(fullText);
               } else if (data.type === 'citations') {
-                // Store citations
+                // Store citations for when streaming completes
+                streamCitations = data.data || [];
               } else if (data.type === 'done') {
                 setMessages(prev => [...prev, {
                   role: 'assistant', content: fullText,
-                  citations: data.citations || [], id: Date.now() + 1,
+                  citations: streamCitations, id: Date.now() + 1,
                 }]);
                 setStreamText('');
               } else if (data.type === 'error') {

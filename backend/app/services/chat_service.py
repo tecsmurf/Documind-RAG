@@ -1,6 +1,6 @@
 """
-Chat Service — RAG-powered conversational AI
-=============================================
+Chat Service — RAG-powered conversational AI (Google Gemini - FREE)
+====================================================================
 
 The complete RAG pipeline:
 
@@ -12,18 +12,21 @@ The complete RAG pipeline:
          ↓
     Construct prompt: system + context + conversation history + question
          ↓
-    Call OpenAI LLM
+    Call Google Gemini LLM (FREE tier: 15 RPM, 1M TPM)
          ↓
     Stream response back with citations
          ↓
     Save to conversation history
 
-This is the "AG" in RAG (Augmented Generation).
+Why Gemini instead of OpenAI?
+    - Gemini 2.0 Flash is FREE (15 requests/min, 1500/day)
+    - OpenAI GPT-4o-mini costs $0.15/1M input tokens
+    - Quality is excellent for RAG use cases
 """
 import json
 from typing import AsyncGenerator
 
-from openai import AsyncOpenAI
+import google.generativeai as genai
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -31,7 +34,7 @@ from app.core.config import settings
 from app.models import Conversation, Message
 from app.services.retrieval_service import retrieve_relevant_chunks, build_context
 
-client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+genai.configure(api_key=settings.GOOGLE_API_KEY)
 
 SYSTEM_PROMPT = """You are an AI research assistant. You answer questions based on the provided document context.
 
@@ -61,6 +64,18 @@ async def get_conversation_history(db: AsyncSession, conversation_id: int, limit
     return [{"role": m.role, "content": m.content} for m in messages]
 
 
+def _build_gemini_history(history: list[dict]) -> list[dict]:
+    """
+    Convert our message format to Gemini's format.
+    Gemini uses 'user' and 'model' roles (not 'assistant').
+    """
+    gemini_history = []
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+    return gemini_history
+
+
 async def chat(
     db: AsyncSession,
     user_id: int,
@@ -84,22 +99,22 @@ async def chat(
     # Step 3: Get conversation history
     history = await get_conversation_history(db, conversation_id)
 
-    # Step 4: Construct messages
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
-        *history,
-        {"role": "user", "content": question},
-    ]
-
-    # Step 5: Call LLM
-    response = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=messages,
-        temperature=0.1,  # Low temperature for factual answers
-        max_tokens=2000,
+    # Step 4: Create Gemini model with system instruction
+    model = genai.GenerativeModel(
+        model_name=settings.GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT.format(context=context),
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.1,
+            max_output_tokens=2000,
+        ),
     )
 
-    answer = response.choices[0].message.content
+    # Step 5: Build chat with history and ask
+    gemini_history = _build_gemini_history(history)
+    chat_session = model.start_chat(history=gemini_history)
+    response = chat_session.send_message(question)
+
+    answer = response.text
 
     # Step 6: Build citations from retrieved chunks
     citations = [
@@ -138,9 +153,9 @@ async def chat_stream(
     Streaming RAG chat — yields tokens as they're generated.
     
     This is how ChatGPT-style streaming works:
-    1. We send the request to OpenAI with stream=True
-    2. OpenAI sends back tokens one at a time
-    3. We yield each token immediately
+    1. We send the request to Gemini with stream=True
+    2. Gemini sends back chunks of text
+    3. We yield each chunk immediately
     4. The frontend displays them as they arrive (SSE)
     
     The user sees the response being "typed" in real-time.
@@ -152,21 +167,19 @@ async def chat_stream(
     context = build_context(chunks)
     history = await get_conversation_history(db, conversation_id)
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
-        *history,
-        {"role": "user", "content": question},
-    ]
-
-    # Stream from OpenAI
-    full_response = ""
-    stream = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=messages,
-        temperature=0.1,
-        max_tokens=2000,
-        stream=True,
+    # Create Gemini model
+    model = genai.GenerativeModel(
+        model_name=settings.GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT.format(context=context),
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.1,
+            max_output_tokens=2000,
+        ),
     )
+
+    # Build chat with history
+    gemini_history = _build_gemini_history(history)
+    chat_session = model.start_chat(history=gemini_history)
 
     # Build citations
     citations = [
@@ -184,12 +197,14 @@ async def chat_stream(
     # First, send citations as a special event
     yield f"data: {json.dumps({'type': 'citations', 'data': citations})}\n\n"
 
-    # Then stream the answer tokens
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            full_response += delta.content
-            yield f"data: {json.dumps({'type': 'token', 'data': delta.content})}\n\n"
+    # Stream from Gemini
+    full_response = ""
+    response = chat_session.send_message(question, stream=True)
+
+    for chunk in response:
+        if chunk.text:
+            full_response += chunk.text
+            yield f"data: {json.dumps({'type': 'token', 'data': chunk.text})}\n\n"
 
     # Signal completion
     yield f"data: {json.dumps({'type': 'done'})}\n\n"

@@ -1,9 +1,9 @@
 """
-Embedding Service — Convert text to vectors using OpenAI
-========================================================
+Embedding Service — Convert text to vectors using Google Gemini (FREE)
+======================================================================
 
 What are embeddings?
-    Text → [0.023, -0.041, 0.089, ...] (1536 numbers)
+    Text → [0.023, -0.041, 0.089, ...] (768 numbers with Gemini)
     
     Similar text → similar vectors → can find by distance
     
@@ -11,50 +11,50 @@ What are embeddings?
     "Coding in Python"    → [0.1, 0.3, -0.2, ...]  ← SIMILAR vectors!
     "Cooking recipes"     → [-0.5, 0.1, 0.8, ...]  ← DIFFERENT vector
 
-This is how RAG retrieval works:
-    1. Convert user question to a vector
-    2. Find the document chunks with the most similar vectors
-    3. Those chunks are the relevant context for answering
+Why Gemini instead of OpenAI?
+    - Google Gemini text-embedding-004 is FREE (1500 requests/day)
+    - OpenAI text-embedding-3-small costs $0.02/1M tokens
+    - Quality is comparable for RAG use cases
 """
-from openai import AsyncOpenAI
+import google.generativeai as genai
 
 from app.core.config import settings
 
-client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+genai.configure(api_key=settings.GOOGLE_API_KEY)
 
 
 async def get_embedding(text: str) -> list[float]:
-    """Convert a single text to an embedding vector."""
-    response = await client.embeddings.create(
-        model=settings.OPENAI_EMBEDDING_MODEL,
-        input=text,
+    """Convert a single text to an embedding vector using Gemini."""
+    result = genai.embed_content(
+        model=f"models/{settings.GEMINI_EMBEDDING_MODEL}",
+        content=text,
+        task_type="retrieval_query",
     )
-    return response.data[0].embedding
+    return result["embedding"]
 
 
 async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     """
-    Convert multiple texts to embedding vectors in one API call.
+    Convert multiple texts to embedding vectors.
     
-    Batching is important for cost and speed:
-    - 1 API call for 100 texts instead of 100 separate calls
-    - OpenAI embedding API supports up to 2048 inputs per batch
+    Gemini embed_content supports batching natively — pass a list of strings
+    and get back a list of embeddings in one API call.
     """
     if not texts:
         return []
 
-    # OpenAI allows max 2048 inputs per request
-    batch_size = 2048
+    # Gemini supports batch embedding — pass list of texts
+    # Process in batches of 100 to avoid potential limits
+    batch_size = 100
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        response = await client.embeddings.create(
-            model=settings.OPENAI_EMBEDDING_MODEL,
-            input=batch,
+        result = genai.embed_content(
+            model=f"models/{settings.GEMINI_EMBEDDING_MODEL}",
+            content=batch,
+            task_type="retrieval_document",
         )
-        # Results come back in same order as input
-        batch_embeddings = [item.embedding for item in response.data]
-        all_embeddings.extend(batch_embeddings)
+        all_embeddings.extend(result["embedding"])
 
     return all_embeddings
