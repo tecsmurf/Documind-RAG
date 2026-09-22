@@ -78,14 +78,8 @@ async def get_db():
 
 
 async def init_db():
-    """Create pgvector extension and all tables.
-    
-    NOTE: We drop and recreate tables to handle the vector dimension change
-    from 1536 (OpenAI) to 3072 (Gemini). In production, use Alembic migrations.
-    """
+    """Create pgvector extension and all tables."""
     async with engine.begin() as conn:
         # Enable pgvector extension
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        # Drop existing tables to handle vector dimension change
-        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
