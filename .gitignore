@@ -7,3 +7,7 @@ uploads/
 node_modules/
 dist/
 .DS_Store
+.env.*
+!.env.example
+.pytest_cache/
+coverage/

@@ -1,30 +1,38 @@
 """
-Document Upload & Management Endpoints
-=======================================
+Document endpoints
+==================
 
-POST /api/documents/upload  → Upload a file → process → chunk → embed → store
-GET  /api/documents         → List user's documents
-GET  /api/documents/{id}    → Get document details + chunk count
-DELETE /api/documents/{id}  → Delete document and all its chunks
+POST   /api/documents/upload                     → validate, create `processing` row, ingest in background
+GET    /api/documents                            → list the caller's documents (with live processing stage)
+GET    /api/documents/{id}                       → one document
+GET    /api/documents/{id}/chunks/{chunk_id}     → one passage (used to open a citation)
+DELETE /api/documents/{id}                       → delete document + chunks
+
+Every lookup filters on user_id in SQL. Another user's id gives the same 404
+as a missing id, so ids cannot be probed.
 """
-import os
-import aiofiles
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+import hashlib
+from datetime import datetime
 from typing import Optional
 
-from app.api.auth import get_current_user
-from app.database import get_db
-from app.models import User, Document, Chunk
-from app.services.document_service import extract_text_from_file, clean_text, chunk_text
-from app.services.embedding_service import get_embeddings_batch
+from fastapi import APIRouter, Depends, File, UploadFile
+from pydantic import BaseModel
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import enforce_rate_limit, get_current_user
+from app.core import rate_limit
 from app.core.config import settings
+from app.core.errors import AppError
+from app.database import get_db
+from app.models import Chunk, Document, User
+from app.models.models import DocumentStatus, ProcessingStage
+from app.services.document_service import DocumentRejected, sanitize_filename, validate_upload
+from app.services.ingestion_service import reap_stale_documents, schedule_ingestion
 
 router = APIRouter()
+
+_READ_BLOCK = 1024 * 1024
 
 
 class DocumentResponse(BaseModel):
@@ -34,8 +42,63 @@ class DocumentResponse(BaseModel):
     file_size: int
     total_chunks: int
     status: str
+    processing_stage: Optional[str] = None
+    page_count: Optional[int] = None
     error_message: Optional[str] = None
     created_at: str
+    updated_at: Optional[str] = None
+
+
+class ChunkResponse(BaseModel):
+    id: int
+    document_id: int
+    filename: str
+    chunk_index: int
+    page_number: Optional[int] = None
+    content: str
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def to_response(d: Document) -> DocumentResponse:
+    return DocumentResponse(
+        id=d.id,
+        filename=d.filename,
+        file_type=d.file_type,
+        file_size=d.file_size,
+        total_chunks=d.total_chunks or 0,
+        status=d.status,
+        processing_stage=d.processing_stage,
+        page_count=d.page_count,
+        error_message=d.error_message if d.status == DocumentStatus.ERROR else None,
+        created_at=_iso(d.created_at),
+        updated_at=_iso(d.updated_at),
+    )
+
+
+async def _owned_document(db: AsyncSession, doc_id: int, user: User) -> Document:
+    doc = (
+        await db.execute(select(Document).where(Document.id == doc_id, Document.user_id == user.id))
+    ).scalar_one_or_none()
+    if doc is None:
+        raise AppError(404, "Document not found.")
+    return doc
+
+
+async def _read_limited(file: UploadFile) -> bytes:
+    """Read at most MAX_FILE_SIZE + 1 bytes (the middleware already caps the body)."""
+    limit = settings.max_file_size_bytes
+    buf = bytearray()
+    while True:
+        block = await file.read(_READ_BLOCK)
+        if not block:
+            break
+        buf.extend(block)
+        if len(buf) > limit:
+            raise AppError(413, f"File is too large. The maximum size is {settings.MAX_FILE_SIZE_MB} MB.")
+    return bytes(buf)
 
 
 @router.post("/upload", response_model=DocumentResponse, status_code=201)
@@ -44,143 +107,91 @@ async def upload_document(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Upload a document, process it through the RAG pipeline.
-    
-    The complete pipeline:
-    1. Save file to disk
-    2. Extract text (PDF/TXT/MD)
-    3. Clean text
-    4. Split into chunks
-    5. Generate embeddings for all chunks (batch API call)
-    6. Store chunks + embeddings in pgvector
-    7. Return document metadata
-    """
-    # Validate file type
-    filename = file.filename or "unknown"
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in ("pdf", "txt", "md"):
-        raise HTTPException(400, f"Unsupported file type: {ext}. Use PDF, TXT, or MD.")
+    await enforce_rate_limit(rate_limit.UPLOAD_USER, str(user.id))
 
-    # Validate file size
-    content = await file.read()
-    file_size = len(content)
-    if file_size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(400, f"File too large. Max: {settings.MAX_FILE_SIZE_MB}MB")
+    filename = sanitize_filename(file.filename)
+    data = await _read_limited(file)
+    try:
+        file_type = validate_upload(filename, data)
+    except DocumentRejected as exc:
+        raise AppError(exc.status_code, exc.message) from None
 
-    # Create upload directory
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{user.id}_{int(datetime.now().timestamp())}_{filename}")
+    content_hash = hashlib.sha256(data).hexdigest()
+    existing = (
+        await db.execute(
+            select(Document).where(Document.user_id == user.id, Document.content_hash == content_hash)
+        )
+    ).scalars().all()
+    if any(d.status in (DocumentStatus.READY, DocumentStatus.PROCESSING) for d in existing):
+        raise AppError(409, "You have already uploaded this document.")
+    # Re-uploading a file that previously failed replaces the failed entry.
+    for failed in existing:
+        await db.delete(failed)
 
-    # Save file
-    async with aiofiles.open(file_path, "wb") as f:
-        await f.write(content)
+    count = (
+        await db.execute(select(func.count()).select_from(Document).where(Document.user_id == user.id))
+    ).scalar_one()
+    if count - len(existing) >= settings.MAX_DOCUMENTS_PER_USER:
+        raise AppError(400, f"Document limit reached ({settings.MAX_DOCUMENTS_PER_USER}). Delete a document first.")
 
-    # Create document record
     doc = Document(
         user_id=user.id,
         filename=filename,
-        file_type=ext,
-        file_size=file_size,
-        status="processing",
+        file_type=file_type,
+        file_size=len(data),
+        status=DocumentStatus.PROCESSING,
+        processing_stage=ProcessingStage.UPLOADING,
+        content_hash=content_hash,
+        total_chunks=0,
     )
     db.add(doc)
-    await db.flush()
+    await db.commit()  # the background task reads this row with its own session
     await db.refresh(doc)
-
-    try:
-        # Step 2-3: Extract and clean text
-        raw_text = extract_text_from_file(file_path, ext)
-        cleaned_text = clean_text(raw_text)
-
-        if not cleaned_text:
-            raise ValueError("No text could be extracted from the file")
-
-        # Step 4: Chunk the text
-        chunks_data = chunk_text(cleaned_text)
-
-        if not chunks_data:
-            raise ValueError("Text could not be split into chunks")
-
-        # Step 5: Generate embeddings for all chunks (single batch API call)
-        chunk_texts = [c["content"] for c in chunks_data]
-        embeddings = await get_embeddings_batch(chunk_texts)
-
-        # Step 6: Store chunks with embeddings
-        for chunk_info, embedding in zip(chunks_data, embeddings):
-            chunk = Chunk(
-                document_id=doc.id,
-                content=chunk_info["content"],
-                chunk_index=chunk_info["chunk_index"],
-                page_number=chunk_info.get("page_number"),
-                embedding=embedding,
-            )
-            db.add(chunk)
-
-        # Step 7: Mark document as ready
-        doc.total_chunks = len(chunks_data)
-        doc.status = "ready"
-        await db.flush()
-
-    except Exception as e:
-        doc.status = "error"
-        doc.error_message = str(e)
-        await db.flush()
-        # Don't raise — return the document with error status
-
-    # Clean up file (optional: keep for re-processing)
-    try:
-        os.remove(file_path)
-    except OSError:
-        pass
-
-    return DocumentResponse(
-        id=doc.id,
-        filename=doc.filename,
-        file_type=doc.file_type,
-        file_size=doc.file_size,
-        total_chunks=doc.total_chunks,
-        status=doc.status,
-        error_message=doc.error_message,
-        created_at=doc.created_at.isoformat(),
-    )
+    schedule_ingestion(doc.id, data, file_type)
+    return to_response(doc)
 
 
 @router.get("", response_model=list[DocumentResponse])
-async def list_documents(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """List all documents for the current user."""
-    result = await db.execute(
-        select(Document)
-        .where(Document.user_id == user.id)
-        .order_by(Document.created_at.desc())
-    )
-    docs = result.scalars().all()
-    return [
-        DocumentResponse(
-            id=d.id, filename=d.filename, file_type=d.file_type,
-            file_size=d.file_size, total_chunks=d.total_chunks,
-            status=d.status, error_message=d.error_message,
-            created_at=d.created_at.isoformat(),
+async def list_documents(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await reap_stale_documents(user.id)
+    docs = (
+        await db.execute(
+            select(Document).where(Document.user_id == user.id).order_by(Document.created_at.desc(), Document.id.desc())
         )
-        for d in docs
-    ]
+    ).scalars().all()
+    return [to_response(d) for d in docs]
+
+
+@router.get("/{doc_id}", response_model=DocumentResponse)
+async def get_document(doc_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    return to_response(await _owned_document(db, doc_id, user))
+
+
+@router.get("/{doc_id}/chunks/{chunk_id}", response_model=ChunkResponse)
+async def get_chunk(
+    doc_id: int, chunk_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    row = (
+        await db.execute(
+            select(Chunk.id, Chunk.document_id, Chunk.chunk_index, Chunk.page_number, Chunk.content, Document.filename)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.id == chunk_id, Chunk.document_id == doc_id, Document.user_id == user.id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise AppError(404, "Passage not found.")
+    return ChunkResponse(
+        id=row.id,
+        document_id=row.document_id,
+        filename=row.filename,
+        chunk_index=row.chunk_index,
+        page_number=row.page_number,
+        content=row.content,
+    )
 
 
 @router.delete("/{doc_id}", status_code=204)
-async def delete_document(
-    doc_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Delete a document and all its chunks/embeddings."""
-    result = await db.execute(select(Document).where(Document.id == doc_id))
-    doc = result.scalar_one_or_none()
-    if not doc:
-        raise HTTPException(404, "Document not found")
-    if doc.user_id != user.id:
-        raise HTTPException(403, "Access denied")
+async def delete_document(doc_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    doc = await _owned_document(db, doc_id, user)
+    await db.execute(delete(Chunk).where(Chunk.document_id == doc.id))
     await db.delete(doc)
-    await db.flush()
